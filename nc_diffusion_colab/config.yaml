@@ -1,0 +1,22 @@
+# 物理與網格參數
+physics:
+  x_min: 0.0
+  x_max: 1.0
+  t_min: 0.0
+  t_max: 1.0
+  nx: 101  # 空間網格點數
+  nt: 101  # 時間步數
+
+# 神經網路與訓練參數
+training:
+  learning_rate: 0.001
+  epochs: 1000
+
+# 視覺化參數
+visualization:
+  animation_fps: 25
+
+# 儲存路徑
+paths:
+  # 這個路徑會將結果儲存到「我的雲端硬碟」下的「NC_Diff_Project」資料夾中
+  output_dir: '/content/drive/MyDrive/nc_diffusion_colab'
