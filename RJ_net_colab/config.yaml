@@ -29,5 +29,5 @@ visualization:
 
 # 儲存路徑
 paths:
-  # 這個路徑會將結果儲存到「我的雲端硬碟」下的「RJ_net_colab」資料夾中
-  output_dir: '/content/drive/MyDrive/RJ_net_colab'
+  # 結果將儲存到本地的 results 資料夾中
+  output_dir: './results'
