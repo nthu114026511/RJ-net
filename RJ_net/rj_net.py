@@ -221,7 +221,6 @@ def train_rj_net(config, output_dir):
             
             # Update for next iteration (detach to avoid backprop through time)
             rho_current = rho_next.detach()
-            rho_current.requires_grad = True
             J_current = J_next.detach()
             R_current = R_next.detach()
         
@@ -287,8 +286,8 @@ def evaluate_rj_net(velocity_net, reaction_net, x, time_steps, config, device):
     J_history.append(J_current.cpu().numpy())
     
     # Time marching (evaluation mode)
-    with torch.no_grad():
-        for n in range(p['nt'] - 1):
+    for n in range(p['nt'] - 1):
+        with torch.no_grad():
             net_input = torch.cat([x, rho_current], dim=1)
             
             # Predict
@@ -297,10 +296,10 @@ def evaluate_rj_net(velocity_net, reaction_net, x, time_steps, config, device):
             
             # Update R
             R_next = R_current + DT * r_current
-            
-            # Update J (需要計算梯度)
-            x_temp = x.clone()
-            x_temp.requires_grad = True
+        
+        # Update J (需要計算梯度，使用 enable_grad 上下文管理器)
+        with torch.enable_grad():
+            x_temp = x.clone().requires_grad_(True)
             rho_temp = rho_current.clone()
             net_input_temp = torch.cat([x_temp, rho_temp], dim=1)
             u_temp = velocity_net(net_input_temp)
@@ -310,7 +309,8 @@ def evaluate_rj_net(velocity_net, reaction_net, x, time_steps, config, device):
                 grad_outputs=torch.ones_like(u_temp), 
                 create_graph=False
             )[0]
-            
+        
+        with torch.no_grad():
             J_next = J_current * (1 + DT * du_dx)
             
             # Update ρ
@@ -339,61 +339,6 @@ def evaluate_rj_net(velocity_net, reaction_net, x, time_steps, config, device):
 # ===========================
 # Additional Analysis
 # ===========================
-
-def perform_analysis(x_np, u_history, r_history, time_steps_np, config, device, output_dir):
-    """Perform additional analysis on learned velocity and reaction fields."""
-    
-    p = config['physics']
-    
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # Select time indices for visualization
-    time_indices = [0, len(u_history)//3, 2*len(u_history)//3, len(u_history)-1]
-    
-    for idx in time_indices:
-        if idx < len(u_history):
-            t_val = time_steps_np[idx+1]  # +1 because we didn't store initial u,r
-            axes[0, 0].plot(x_np, u_history[idx], label=f't={t_val:.2f}')
-            axes[0, 1].plot(x_np, r_history[idx], label=f't={t_val:.2f}')
-    
-    axes[0, 0].set_title('Velocity Field u(x,t)')
-    axes[0, 0].set_xlabel('x')
-    axes[0, 0].set_ylabel('u')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
-    
-    axes[0, 1].set_title('Reaction Rate r(x,t)')
-    axes[0, 1].set_xlabel('x')
-    axes[0, 1].set_ylabel('r')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    # Compare learned reaction with exact reaction
-    rho_test = torch.linspace(0, 1, 100, device=device).view(-1, 1)
-    x_test = 0.5 * torch.ones_like(rho_test)
-    net_input_test = torch.cat([x_test, rho_test], dim=1)
-    
-    # Need to access reaction_net - pass it as parameter or make it accessible
-    # For now, we'll skip this part in the standalone function
-    
-    axes[1, 0].set_title('Reaction Rate: Learned vs Exact')
-    axes[1, 0].set_xlabel('ρ')
-    axes[1, 0].set_ylabel('r(ρ)')
-    axes[1, 0].grid(True)
-    
-    # Mass conservation check: M(t) = ∫ρ dx
-    # This requires rho_numerical_history which should be passed in
-    axes[1, 1].set_title('Total Mass M(t) = ∫ρ dx')
-    axes[1, 1].set_xlabel('t')
-    axes[1, 1].set_ylabel('M(t)')
-    axes[1, 1].grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/analysis.png", dpi=150)
-    plt.close()
-    
-    print("✅ Additional analysis complete!")
-
 
 def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, 
                          time_steps_np, reaction_net, config, device, output_dir):
@@ -443,7 +388,12 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history,
     axes[1, 0].grid(True)
     
     # Mass conservation check: M(t) = ∫ρ dx
-    mass_history = [np.trapz(rho, x_np.flatten()) for rho in rho_numerical_history]
+    x_flat = x_np.flatten()
+    # Use trapezoid (NumPy 2.0+) or trapz (older versions) for compatibility
+    try:
+        mass_history = [np.trapezoid(rho.flatten(), x_flat) for rho in rho_numerical_history]
+    except AttributeError:
+        mass_history = [np.trapz(rho.flatten(), x_flat) for rho in rho_numerical_history]
     axes[1, 1].plot(time_steps_np, mass_history, 'b-', linewidth=2)
     axes[1, 1].set_title('Total Mass M(t) = ∫ρ dx')
     axes[1, 1].set_xlabel('t')
@@ -517,17 +467,17 @@ def main():
     # Plot loss history
     plotter.plot_loss(loss_history, config, f"{output_dir}/loss.png")
     
-    # Plot comparison
-    plotter.plot_comparison(x_np, rho_numerical_history, config, f"{output_dir}/comparison.png")
+    # 創建一個假的 exact_history（與數值解相同），以便 plotter 函數能正常工作
+    # 或者我們可以傳入 None，但需要修改 plotter
+    exact_history_dummy = rho_numerical_history  # 暫時使用數值解作為 "精確解"
     
-    # Plot R and J evolution
-    plotter.plot_reaction_jacobian(x_np, R_history, J_history, config, f"{output_dir}/reaction_jacobian.png")
+    # Plot comparison
+    plotter.plot_comparison(x_np, rho_numerical_history, exact_history_dummy, config, f"{output_dir}/comparison.png")
     
     # Create animation
     plotter.create_animation(
-        x_np, rho_numerical_history, time_steps_np, config, 
-        f"{output_dir}/animation.gif",
-        R_history=R_history, J_history=J_history
+        x_np, rho_numerical_history, exact_history_dummy, time_steps_np, config, 
+        f"{output_dir}/animation.gif"
     )
     
     # Perform additional analysis
