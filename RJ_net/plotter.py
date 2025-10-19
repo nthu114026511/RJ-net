@@ -3,20 +3,28 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 
 
 def plot_loss(loss_history, config, save_path):
-    """Plots and saves the training loss history."""
+    """Plots and saves the PDE loss history."""
     plt.figure(figsize=(10, 6))
-    # 如果 loss_history 是字典，只繪製 total loss
+    # 如果 loss_history 是字典，只繪製 PDE loss
     if isinstance(loss_history, dict):
-        plt.plot(range(1, len(loss_history['total']) + 1), loss_history['total'])
+        plt.plot(range(1, len(loss_history['pde']) + 1), loss_history['pde'], 
+                linewidth=2, label='PDE Loss')
+        plt.yscale('log')
+        plt.title('PDE Loss Evolution During Training')
+        plt.xlabel('Epoch')
+        plt.ylabel('PDE Loss (Log Scale)')
+        plt.legend()
     else:
-        plt.plot(range(1, config['training']['epochs'] + 1), loss_history)
-    plt.yscale('log')
-    plt.title('Training Loss Evolution')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss (Log Scale)')
-    plt.grid(True)
-    plt.savefig(save_path)
-    print(f"-> Loss plot saved to {save_path}")
+        # 如果是列表，當作總 loss 繪製
+        plt.plot(range(1, config['training']['epochs'] + 1), loss_history,
+                linewidth=2)
+        plt.yscale('log')
+        plt.title('Training Loss Evolution')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (Log Scale)')
+    plt.grid(True, alpha=0.3)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"-> PDE Loss plot saved to {save_path}")
 
 
 def plot_comparison(x_np, numerical_history, exact_history, config, save_path):

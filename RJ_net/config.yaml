@@ -1,15 +1,20 @@
 # 物理與網格參數
 physics:
-  x_min: 0.0
-  x_max: 1.0
+  x_min: -5.0
+  x_max: 5.0
   t_min: 0.0
-  t_max: 1.0
-  nx: 101  # 空間網格點數
+  t_max: 2.0
+  nx: 201  # 空間網格點數
   nt: 101  # 時間步數
   
-  # 反應參數 (ρ_t = Δρ + ρ - ρ²)
-  k_plus: 1.0   # 線性增長係數
-  k_minus: 1.0  # 二次抑制係數
+  # Fisher-KPP 旅行波參數
+  # ∂ρ/∂t = D·∂²ρ/∂x² + k⁺ρ - k⁻ρ²
+  nu: 1.0          # 擴散係數 D = 1
+  k_plus: 1.0      # 反應係數 k⁺ = 1
+  k_minus: 1.0     # 反應係數 k⁻ = 1 (故 r(ρ) = ρ(1-ρ))
+  # 波速 s = 5/√6
+  # 特徵長度 L = √6
+  # 精確解: ρ(x,t) = [1 + exp(-(x - s·t - x₀)/L)]⁻²
 
 # 神經網路與訓練參數
 training:
@@ -19,7 +24,7 @@ training:
   
   # 損失函數權重
   weight_pde: 1.0
-  weight_bc: 1.0
+  weight_bc: 0.1
   weight_ic: 1.0
   weight_reaction: 1.0
 

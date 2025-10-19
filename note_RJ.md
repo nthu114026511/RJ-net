@@ -33,17 +33,30 @@ m(t) = \int_{\Omega} \rho(x,t) dx = \int_{\Omega_{\bar{x}}} (\rho_0(\bar{x}) + \
 \rho_t + \nabla \cdot (\rho u) = \Sigma \vec{r} \quad , \quad \vec{r} = \vec{r}(\vec{\rho})
 $
 
+e.g: $\vec{\rho} = \begin{bmatrix} B \\ R \\ E \end{bmatrix}$
+
+$\vec{u}_B \equiv \vec{u}_R \equiv \vec{u}_E \equiv 0. \quad (ODE)$
+
+? $\vec{r} = \vec{r}_{mn}(\rho) \qquad$ cf $\qquad \vec{u} = \vec{u}_{mn}(\rho)$
+
+$\dot{B} = r B\left(1-\frac{B}{K}\right) = rB - \frac{r}{K} B^2$
+
+$B \underset{k_{-}}{\stackrel{k_{+}}{\rightleftharpoons}} 2B$
+
+$\dot{B} = ^{(+1)}(k_{+}B - k_{-}B^2)$
+
 $
 \text{For } n=0,1,2 \dots \\
 u^{n+1} = u_{NN}(\rho^n) \\
-r_i^{n+1} = r_{i,NN}^n(\vec{\rho}^n)x \\
+r_i^{n+1} = r_{i,NN}^n(\vec{\rho}^n, x) \\
 R_i^{n+1} = R_i^n + \Delta t (r_i^n) \\
 J^{n+1} = J^n + \Delta t (\nabla \cdot u) J^n - u \cdot \nabla J \\
 \rho^{n+1} = \frac{\rho_0 + R^{n+1}}{J^{n+1}}
 $
 
 $
-\rho_t = \underbrace{\Delta \rho}_{\text{}} + \underbrace{(k^+ \rho - \hat{k}^- \rho^2)}_{\text{}} \\
+\rho_t = \Delta \rho + (k^+ \rho - k^- \rho^2) \\
+r(\rho) = k^+ \rho - k^- \rho^2 \\
 \underline{x_t = \frac{x^{n+1}-x^n}{\Delta t} \approx u} \\
 R_t = \frac{R^{n+1}-R^n}{\Delta t} \approx r_{NN} \\
 r_{NN} = r(\rho) \\

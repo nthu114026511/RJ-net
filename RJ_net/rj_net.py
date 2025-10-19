@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RJ-net: Reaction-Jacobian Network for Reaction-Diffusion-Convection Systems
+DR-PINN: Diffusion-Reaction Physics-Informed Neural Network
 
-本程式實現了基於物理的神經網路（PINN）求解反應-擴散-對流系統：
+本程式實現了基於物理的神經網路（PINN）求解擴散-反應系統：
 
-    ρ_t + ∇·(ρu) = Δρ + Σr_i
+    ∂ρ/∂t = ν·∇²ρ + r(x, ρ)
 
-核心方程：
-    1. 密度更新: ρ^{n+1} = (ρ_0 + R^{n+1}) / J^{n+1}
-    2. 速度場: u^{n+1} = u_NN(ρ^n)
-    3. 反應率: r^{n+1} = r_NN(ρ^n)
-    4. 反應累積: R^{n+1} = R^n + Δt·r^n
-    5. Jacobian: J^{n+1} = J^n + Δt[(∇·u)J^n - u·∇J]
+核心方程（使用有限差分離散化）：
+    1. 時間導數: ∂ρ/∂t = (ρ^{n+1} - ρ^n) / Δt
+    2. 擴散項: ν·∇²ρ = ν·∂²ρ/∂x²（二階中心差分）
+    3. 反應項: r(x, ρ) = k⁺ρ - k⁻ρ²
+    4. 反應率網路: r_{NN}(x, ρ)（由 ReactionNet 學習）
+    5. 時間推進: ρ^{n+1} = ρ^n + Δt·(ν·∂²ρ/∂x² + r_{NN})
 
-測試問題: Fisher-KPP 方程
-    ρ_t = Δρ + k⁺ρ - k⁻ρ²
-    其中 k⁺ρ - k⁻ρ² 是 logistic 反應項
+測試問題: 擴散-反應系統
+    ∂ρ/∂t = ν·∂²ρ/∂x² + k⁺ρ - k⁻ρ²
+    其中 ν 是擴散係數，k⁺ρ - k⁻ρ² 是 logistic 反應項
+    
+特色：
+    - 使用有限差分計算空間導數
+    - PDE 殘差改為擴散-反應形式
+    - 讓模型從物理殘差學習反應項的參數化
 """
 
 import os
@@ -37,7 +42,7 @@ import plotter
 # ===========================
 
 class VelocityNet(nn.Module):
-    """Neural network to predict velocity field u(x, ρ)."""
+    """Neural network to predict velocity u(x, ρ)."""
     def __init__(self, hidden_size=32):
         super().__init__()
         self.network = nn.Sequential(
@@ -77,13 +82,36 @@ def exact_reaction(rho, k_plus, k_minus):
     return k_plus * rho - k_minus * rho**2
 
 
-def initial_condition(x):
-    """Initial condition: Gaussian bump or sine wave."""
-    # Option 1: Gaussian
-    # return torch.exp(-50 * (x - 0.5)**2)
+def exact_traveling_wave(x, t, x0=0.0):
+    """
+    Fisher-KPP 精確旅行波解：
     
-    # Option 2: Sine wave
-    return 0.5 * (1 + torch.sin(2 * torch.pi * x))
+    ρ(x, t) = [1 + exp(-(x - st - x0)/√6)]^{-2}
+    
+    其中波速 s = 5/√6
+    """
+    sqrt6 = torch.sqrt(torch.tensor(6.0, device=x.device, dtype=x.dtype))
+    s = 5.0 / sqrt6  # 波速
+    xi = (x - s * t - x0) / sqrt6  # 行進波座標
+    return (1.0 + torch.exp(-xi))**(-2)
+
+
+def initial_condition(x, x0=0.0):
+    """
+    Initial condition: Fisher-KPP 旅行波 (Ablowitz-Zeppetella)
+    
+    ρ(x, 0) = [1 + exp(-(x - x0)/√6)]^{-2}
+    
+    其中：
+    - 擴散係數 D = 1
+    - 反應係數 k⁺ = 1, k⁻ = 1 (r(ρ) = ρ(1-ρ))
+    - 波速 s = 5/√6
+    - 特徵長度 L = √6
+    - 平移參數 x0 ∈ ℝ
+    """
+    sqrt6 = torch.sqrt(torch.tensor(6.0, device=x.device, dtype=x.dtype))
+    # 精確解的初始條件
+    return (1.0 + torch.exp(-(x - x0) / sqrt6))**(-2)
 
 
 # ===========================
@@ -127,92 +155,103 @@ def train_rj_net(config, output_dir):
         'reaction': []
     }
     
+    # Get diffusion coefficient
+    nu = p.get('nu', 0.01)  # diffusion coefficient
+    
     print(f"✅ Training setup complete.")
     print(f"   Spatial points: {p['nx']}")
     print(f"   Time steps: {p['nt']}")
     print(f"   dt = {DT:.6f}")
+    print(f"   dx = {(p['x_max'] - p['x_min']) / (p['nx'] - 1):.6f}")
     print(f"   Network architecture: {t['hidden_size']} hidden units")
     print(f"   Reaction parameters: k⁺={p['k_plus']}, k⁻={p['k_minus']}")
     
-    # ===========================
-    # Training Loop
-    # ===========================
-    
     print("\nStarting training...\n")
+    
+    dx = (p['x_max'] - p['x_min']) / (p['nx'] - 1)
     
     for epoch in range(t['epochs']):
         optimizer.zero_grad()
         
-        # Initialize variables
-        rho_0 = initial_condition(x).detach()  # Initial density (constant)
-        rho_current = rho_0.clone()
-        J_current = torch.ones_like(x, device=device)  # Initial Jacobian = 1
-        R_current = torch.zeros_like(x, device=device)  # Initial reaction accumulation = 0
+        # Initialize variables according to: ρ = (ρ₀ + R) / J
+        rho_0 = initial_condition(x).detach()  # Initial density ρ₀
+        R_current = torch.zeros_like(rho_0)     # R(t=0) = 0
+        J_current = torch.ones_like(rho_0)      # J(t=0) = 1
+        rho_current = (rho_0 + R_current) / J_current
         
         total_loss = 0.0
         total_loss_pde = 0.0
         total_loss_bc = 0.0
         total_loss_reaction = 0.0
         
-        # Time marching
+        # Time marching: For n=0,1,2,...
         for n in range(p['nt'] - 1):
-            # Prepare network input: [x, ρ]
+            # Prepare network input: [x, ρⁿ]
             net_input = torch.cat([x, rho_current], dim=1)
             
-            # === 1. Predict velocity and reaction rate ===
-            u_current = velocity_net(net_input)
-            r_current = reaction_net(net_input)
+            # === 1. Predict velocity uⁿ⁺¹ = u_NN(ρⁿ) ===
+            u_next = velocity_net(net_input)
             
-            # === 2. Update R (reaction accumulation) ===
-            R_next = R_current + DT * r_current
+            # === 2. Predict reaction rate rⁱⁿ⁺¹ = r_NN(ρⁿ, x) ===
+            r_next = reaction_net(net_input)
             
-            # === 3. Update J (Jacobian) ===
-            # Compute ∂u/∂x
-            du_dx = torch.autograd.grad(
-                u_current, x, 
-                grad_outputs=torch.ones_like(u_current), 
-                create_graph=True
-            )[0]
+            # === 3. Update reaction integral: Rⁱⁿ⁺¹ = Rⁱⁿ + Δt·rⁱⁿ ===
+            R_next = R_current + DT * r_next
             
-            # J^{n+1} = J^n * (1 + Δt * ∂u/∂x)
-            # Simplified version (assuming u·∇J ≈ 0 for 1D)
-            J_next = J_current * (1 + DT * du_dx)
+            # === 4. Compute ∇·u for Jacobian update ===
+            # ∂u/∂x using finite differences (中心差分)
+            du_dx = torch.zeros_like(u_next)
+            du_dx[1:-1] = (u_next[2:] - u_next[:-2]) / (2 * dx)
+            # Boundary: assume zero divergence at boundaries
+            du_dx[0] = du_dx[1]
+            du_dx[-1] = du_dx[-2]
             
-            # === 4. Update ρ (density) ===
-            # ρ^{n+1} = (ρ₀ + R^{n+1}) / J^{n+1}
-            rho_next = (rho_0 + R_next) / J_next
+            # === 5. Update Jacobian: Jⁿ⁺¹ = Jⁿ + Δt·(∇·u)Jⁿ - u·∇J ===
+            # For 1D: ∇J ≈ ∂J/∂x
+            dJ_dx = torch.zeros_like(J_current)
+            dJ_dx[1:-1] = (J_current[2:] - J_current[:-2]) / (2 * dx)
+            dJ_dx[0] = dJ_dx[1]
+            dJ_dx[-1] = dJ_dx[-2]
             
-            # === 5. Compute PDE residual ===
-            # ρ_t ≈ (ρ^{n+1} - ρ^n) / Δt
+            J_next = J_current + DT * (du_dx * J_current - u_next * dJ_dx)
+            
+            # === 6. Update density: ρⁿ⁺¹ = (ρ₀ + Rⁿ⁺¹) / Jⁿ⁺¹ ===
+            # Add small epsilon to avoid division by zero
+            eps = 1e-8
+            J_next_safe = torch.clamp(J_next, min=eps)
+            rho_next = (rho_0 + R_next) / J_next_safe
+            
+            # === 7. Compute spatial derivatives for PDE residual ===
+            # Second derivative ∂²ρ/∂x² (for diffusion term)
+            d2rho_dx2 = torch.zeros_like(rho_current)
+            d2rho_dx2[1:-1] = (rho_current[2:] - 2*rho_current[1:-1] + rho_current[:-2]) / (dx**2)
+            d2rho_dx2[0] = d2rho_dx2[1]
+            d2rho_dx2[-1] = d2rho_dx2[-2]
+            
+            # First derivative ∂ρ/∂x (for boundary condition)
+            drho_dx = torch.zeros_like(rho_current)
+            drho_dx[1:-1] = (rho_current[2:] - rho_current[:-2]) / (2 * dx)
+            drho_dx[0] = drho_dx[1]
+            drho_dx[-1] = drho_dx[-2]
+            
+            # === 8. Compute time derivative ===
             rho_t = (rho_next - rho_current) / DT
             
-            # Compute Laplacian: Δρ = ∂²ρ/∂x²
-            drho_dx = torch.autograd.grad(
-                rho_next, x, 
-                grad_outputs=torch.ones_like(rho_next), 
-                create_graph=True
-            )[0]
-            
-            d2rho_dx2 = torch.autograd.grad(
-                drho_dx, x, 
-                grad_outputs=torch.ones_like(drho_dx), 
-                create_graph=True
-            )[0]
-            
-            # Exact reaction term for comparison
-            r_exact = exact_reaction(rho_next, p['k_plus'], p['k_minus'])
-            
-            # PDE residual: ρ_t = Δρ + r(ρ)
-            pde_residual = rho_t - d2rho_dx2 - r_exact
+            # === 9. Compute PDE residual ===
+            # PDE: ∂ρ/∂t = ν·∂²ρ/∂x² + r(ρ)
+            # Residual: ∂ρ/∂t - ν·∂²ρ/∂x² - r ≈ 0
+            diffusion_term = nu * d2rho_dx2
+            pde_residual = rho_t - diffusion_term - r_next.squeeze()
             loss_pde = torch.mean(pde_residual**2)
             
-            # === 6. Boundary conditions ===
-            # Homogeneous Neumann BC: ∂ρ/∂x = 0 at boundaries
-            loss_bc = drho_dx[0]**2 + drho_dx[-1]**2
+            # === 10. Boundary conditions ===
+            # Neumann BC: 零通量邊界（梯度為零）
+            loss_bc = 0.1 * (drho_dx[0]**2 + drho_dx[-1]**2)
             
-            # === 7. Reaction loss ===
-            # Encourage reaction network to learn the correct reaction term
-            loss_reaction = torch.mean((r_current - r_exact.detach())**2)
+            # === 11. Reaction consistency loss ===
+            # 讓反應網路學到的 r 與 exact reaction 接近
+            r_exact = exact_reaction(rho_current, p['k_plus'], p['k_minus'])
+            loss_reaction = torch.mean((r_next.squeeze() - r_exact.detach())**2)
             
             # Accumulate losses
             total_loss_pde += loss_pde
@@ -221,8 +260,8 @@ def train_rj_net(config, output_dir):
             
             # Update for next iteration (detach to avoid backprop through time)
             rho_current = rho_next.detach()
-            J_current = J_next.detach()
             R_current = R_next.detach()
+            J_current = J_next.detach()
         
         # === 8. Total loss ===
         total_loss = (
@@ -256,11 +295,13 @@ def train_rj_net(config, output_dir):
 # Evaluation Function
 # ===========================
 
-def evaluate_rj_net(velocity_net, reaction_net, x, time_steps, config, device):
+def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, config, device):
     """Generate results in evaluation mode."""
     
     p = config['physics']
     DT = (p['t_max'] - p['t_min']) / (p['nt'] - 1)
+    dx = (p['x_max'] - p['x_min']) / (p['nx'] - 1)
+    nu = p.get('nu', 0.01)
     
     print("\nGenerating results and creating visualizations...\n")
     
@@ -269,78 +310,80 @@ def evaluate_rj_net(velocity_net, reaction_net, x, time_steps, config, device):
     
     # Storage for histories
     rho_numerical_history = []
-    R_history = []
-    J_history = []
+    rho_exact_history = []
     u_history = []
     r_history = []
+    J_history = []
     
     # Initialize
     rho_0 = initial_condition(x).detach()
-    rho_current = rho_0.clone()
-    J_current = torch.ones_like(x, device=device)
-    R_current = torch.zeros_like(x, device=device)
+    R_current = torch.zeros_like(rho_0)
+    J_current = torch.ones_like(rho_0)
+    rho_current = (rho_0 + R_current) / J_current
     
     # Store initial state
     rho_numerical_history.append(rho_current.cpu().numpy())
-    R_history.append(R_current.cpu().numpy())
+    rho_exact_history.append(exact_traveling_wave(x, torch.tensor([p['t_min']], device=device)[0]).cpu().numpy())
     J_history.append(J_current.cpu().numpy())
     
     # Time marching (evaluation mode)
     for n in range(p['nt'] - 1):
+        t_current = time_steps[n+1]  # Current time for exact solution
+        
         with torch.no_grad():
             net_input = torch.cat([x, rho_current], dim=1)
             
-            # Predict
-            u_current = velocity_net(net_input)
-            r_current = reaction_net(net_input)
+            # Predict velocity and reaction rate
+            u_next = velocity_net(net_input)
+            r_next = reaction_net(net_input)
             
-            # Update R
-            R_next = R_current + DT * r_current
-        
-        # Update J (需要計算梯度，使用 enable_grad 上下文管理器)
-        with torch.enable_grad():
-            x_temp = x.clone().requires_grad_(True)
-            rho_temp = rho_current.clone()
-            net_input_temp = torch.cat([x_temp, rho_temp], dim=1)
-            u_temp = velocity_net(net_input_temp)
+            # Update R: Rⁿ⁺¹ = Rⁿ + Δt·r
+            R_next = R_current + DT * r_next
             
-            du_dx = torch.autograd.grad(
-                u_temp, x_temp, 
-                grad_outputs=torch.ones_like(u_temp), 
-                create_graph=False
-            )[0]
-        
-        with torch.no_grad():
-            J_next = J_current * (1 + DT * du_dx)
+            # Compute ∂u/∂x for Jacobian
+            du_dx = torch.zeros_like(u_next)
+            du_dx[1:-1] = (u_next[2:] - u_next[:-2]) / (2 * dx)
+            du_dx[0] = du_dx[1]
+            du_dx[-1] = du_dx[-2]
             
-            # Update ρ
-            rho_next = (rho_0 + R_next) / J_next
+            # Compute ∂J/∂x for Jacobian
+            dJ_dx = torch.zeros_like(J_current)
+            dJ_dx[1:-1] = (J_current[2:] - J_current[:-2]) / (2 * dx)
+            dJ_dx[0] = dJ_dx[1]
+            dJ_dx[-1] = dJ_dx[-2]
             
-            # Store
+            # Update Jacobian: Jⁿ⁺¹ = Jⁿ + Δt·(∇·u)Jⁿ - u·∇J
+            J_next = J_current + DT * (du_dx * J_current - u_next * dJ_dx)
+            
+            # Update density: ρⁿ⁺¹ = (ρ₀ + Rⁿ⁺¹) / Jⁿ⁺¹
+            eps = 1e-8
+            J_next_safe = torch.clamp(J_next, min=eps)
+            rho_next = (rho_0 + R_next) / J_next_safe
+            
+            # Store results
             rho_numerical_history.append(rho_next.cpu().numpy())
-            R_history.append(R_next.cpu().numpy())
+            rho_exact_history.append(exact_traveling_wave(x, t_current).cpu().numpy())
+            u_history.append(u_next.cpu().numpy())
+            r_history.append(r_next.cpu().numpy())
             J_history.append(J_next.cpu().numpy())
-            u_history.append(u_current.cpu().numpy())
-            r_history.append(r_current.cpu().numpy())
             
             # Update for next iteration
             rho_current = rho_next
-            J_current = J_next
             R_current = R_next
+            J_current = J_next
     
     print("✅ Solution generated.")
-    print(f"   Final ρ range: [{rho_numerical_history[-1].min():.4f}, {rho_numerical_history[-1].max():.4f}]")
-    print(f"   Final R range: [{R_history[-1].min():.4f}, {R_history[-1].max():.4f}]")
-    print(f"   Final J range: [{J_history[-1].min():.4f}, {J_history[-1].max():.4f}]")
+    print(f"   Final ρ (numerical) range: [{rho_numerical_history[-1].min():.4f}, {rho_numerical_history[-1].max():.4f}]")
+    print(f"   Final ρ (exact) range: [{rho_exact_history[-1].min():.4f}, {rho_exact_history[-1].max():.4f}]")
     
-    return rho_numerical_history, R_history, J_history, u_history, r_history
+    return rho_numerical_history, rho_exact_history, u_history, r_history, J_history
 
 
 # ===========================
 # Additional Analysis
 # ===========================
 
-def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, 
+def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho_exact_history,
                          time_steps_np, reaction_net, config, device, output_dir):
     """Perform comprehensive analysis including reaction comparison and mass conservation."""
     
@@ -387,26 +430,31 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history,
     axes[1, 0].legend()
     axes[1, 0].grid(True)
     
-    # Mass conservation check: M(t) = ∫ρ dx
+    # 比較數值解與精確解的誤差
     x_flat = x_np.flatten()
-    # Use trapezoid (NumPy 2.0+) or trapz (older versions) for compatibility
-    try:
-        mass_history = [np.trapezoid(rho.flatten(), x_flat) for rho in rho_numerical_history]
-    except AttributeError:
-        mass_history = [np.trapz(rho.flatten(), x_flat) for rho in rho_numerical_history]
-    axes[1, 1].plot(time_steps_np, mass_history, 'b-', linewidth=2)
-    axes[1, 1].set_title('Total Mass M(t) = ∫ρ dx')
+    error_history = []
+    for i in range(len(rho_numerical_history)):
+        error = np.abs(rho_numerical_history[i].flatten() - rho_exact_history[i].flatten())
+        # 使用 L2 誤差
+        l2_error = np.sqrt(np.trapz(error**2, x_flat) if 'trapz' in dir(np) else np.mean(error**2))
+        error_history.append(l2_error)
+    
+    axes[1, 1].plot(time_steps_np, error_history, 'b-', linewidth=2, label='L₂ error: ||ρ_num - ρ_exact||')
+    axes[1, 1].set_title('Error Evolution: Numerical vs Exact Solution')
     axes[1, 1].set_xlabel('t')
-    axes[1, 1].set_ylabel('M(t)')
+    axes[1, 1].set_ylabel('L₂ Error')
+    axes[1, 1].legend()
     axes[1, 1].grid(True)
+    axes[1, 1].set_yscale('log')
     
     plt.tight_layout()
     plt.savefig(f"{output_dir}/analysis.png", dpi=150)
     plt.close()
     
     print("✅ Additional analysis complete!")
-    print(f"   Mass conservation: M(0)={mass_history[0]:.4f}, M(T)={mass_history[-1]:.4f}")
-    print(f"   Relative change: {abs(mass_history[-1] - mass_history[0])/mass_history[0]*100:.2f}%")
+    print(f"   Initial error: {error_history[0]:.6e}")
+    print(f"   Final error: {error_history[-1]:.6e}")
+    print(f"   Max error: {max(error_history):.6e}")
 
 
 # ===========================
@@ -418,7 +466,10 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='RJ-net: Reaction-Jacobian Network')
-    parser.add_argument('--config', type=str, default='config.yaml',
+    # Default config path is in the same directory as this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_config = os.path.join(script_dir, 'config.yaml')
+    parser.add_argument('--config', type=str, default=default_config,
                         help='Path to configuration file')
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory (overrides config)')
@@ -453,7 +504,7 @@ def main():
     velocity_net, reaction_net, loss_history, x, time_steps, device = train_rj_net(config, output_dir)
     
     # Evaluate the model
-    rho_numerical_history, R_history, J_history, u_history, r_history = evaluate_rj_net(
+    rho_numerical_history, rho_exact_history, u_history, r_history, J_history = evaluate_diffusion_reaction(
         velocity_net, reaction_net, x, time_steps, config, device
     )
     
@@ -467,22 +518,15 @@ def main():
     # Plot loss history
     plotter.plot_loss(loss_history, config, f"{output_dir}/loss.png")
     
-    # 創建一個假的 exact_history（與數值解相同），以便 plotter 函數能正常工作
-    # 或者我們可以傳入 None，但需要修改 plotter
-    exact_history_dummy = rho_numerical_history  # 暫時使用數值解作為 "精確解"
-    
-    # Plot comparison
-    plotter.plot_comparison(x_np, rho_numerical_history, exact_history_dummy, config, f"{output_dir}/comparison.png")
-    
-    # Create animation
+    # Create animation (now with exact solution for comparison)
     plotter.create_animation(
-        x_np, rho_numerical_history, exact_history_dummy, time_steps_np, config, 
+        x_np, rho_numerical_history, rho_exact_history, time_steps_np, config, 
         f"{output_dir}/animation.gif"
     )
     
-    # Perform additional analysis
+    # Perform detailed analysis
     perform_full_analysis(
-        x_np, u_history, r_history, rho_numerical_history,
+        x_np, u_history, r_history, rho_numerical_history, rho_exact_history,
         time_steps_np, reaction_net, config, device, output_dir
     )
     
@@ -495,10 +539,7 @@ def main():
     print("="*60)
     print(f"\nResults saved to: {output_dir}")
     print("  - loss.png: Training loss evolution")
-    print("  - comparison.png: Initial vs final states")
-    print("  - reaction_jacobian.png: R and J evolution")
     print("  - animation.gif: Full time evolution")
-    print("  - analysis.png: Velocity, reaction, and mass analysis")
     print("  - config_used.yaml: Configuration used for this run")
     print("\n" + "="*60)
 
