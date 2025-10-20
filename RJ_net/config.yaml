@@ -25,8 +25,8 @@ training:
   # 損失函數權重
   weight_pde: 1.0
   weight_bc: 0.1
-  weight_ic: 1.0
-  weight_reaction: 1.0
+  weight_ic: 10.0    # 強化初始條件約束
+  weight_reaction: 5.0  # 增加反應項權重以改進收斂
 
 # 視覺化參數
 visualization:

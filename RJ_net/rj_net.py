@@ -183,6 +183,13 @@ def train_rj_net(config, output_dir):
         total_loss_pde = 0.0
         total_loss_bc = 0.0
         total_loss_reaction = 0.0
+        total_loss_ic = 0.0
+        
+        # === Initial condition loss ===
+        # 確保初始條件精確
+        rho_ic_exact = exact_traveling_wave(x, torch.tensor([p['t_min']], device=device)[0]).detach()
+        loss_ic = torch.mean((rho_current - rho_ic_exact)**2)
+        total_loss_ic += loss_ic
         
         # Time marching: For n=0,1,2,...
         for n in range(p['nt'] - 1):
@@ -203,16 +210,16 @@ def train_rj_net(config, output_dir):
             du_dx = torch.zeros_like(u_next)
             du_dx[1:-1] = (u_next[2:] - u_next[:-2]) / (2 * dx)
             # Boundary: assume zero divergence at boundaries
-            du_dx[0] = du_dx[1]
-            du_dx[-1] = du_dx[-2]
-            
+            du_dx[0] = (u_next[1] - u_next[0]) / dx
+            du_dx[-1] = (u_next[-1] - u_next[-2]) / dx
+
             # === 5. Update Jacobian: Jⁿ⁺¹ = Jⁿ + Δt·(∇·u)Jⁿ - u·∇J ===
             # For 1D: ∇J ≈ ∂J/∂x
             dJ_dx = torch.zeros_like(J_current)
             dJ_dx[1:-1] = (J_current[2:] - J_current[:-2]) / (2 * dx)
-            dJ_dx[0] = dJ_dx[1]
-            dJ_dx[-1] = dJ_dx[-2]
-            
+            dJ_dx[0] = (J_current[1] - J_current[0]) / dx
+            dJ_dx[-1] = (J_current[-1] - J_current[-2]) / dx
+
             J_next = J_current + DT * (du_dx * J_current - u_next * dJ_dx)
             
             # === 6. Update density: ρⁿ⁺¹ = (ρ₀ + Rⁿ⁺¹) / Jⁿ⁺¹ ===
@@ -223,16 +230,18 @@ def train_rj_net(config, output_dir):
             
             # === 7. Compute spatial derivatives for PDE residual ===
             # Second derivative ∂²ρ/∂x² (for diffusion term)
-            d2rho_dx2 = torch.zeros_like(rho_current)
-            d2rho_dx2[1:-1] = (rho_current[2:] - 2*rho_current[1:-1] + rho_current[:-2]) / (dx**2)
-            d2rho_dx2[0] = d2rho_dx2[1]
-            d2rho_dx2[-1] = d2rho_dx2[-2]
+            drho_dx = torch.autograd.grad(rho_next, x, grad_outputs=torch.ones_like(rho_next), create_graph=True)[0]
+            d2rho_dx2 = torch.autograd.grad(drho_dx, x, grad_outputs=torch.ones_like(drho_dx), create_graph=True)[0]
+            #d2rho_dx2 = torch.zeros_like(rho_current)
+            #d2rho_dx2[1:-1] = (rho_current[2:] - 2*rho_current[1:-1] + rho_current[:-2]) / (dx**2)
+            #d2rho_dx2[0] = d2rho_dx2[1]
+            #d2rho_dx2[-1] = d2rho_dx2[-2]
             
             # First derivative ∂ρ/∂x (for boundary condition)
-            drho_dx = torch.zeros_like(rho_current)
-            drho_dx[1:-1] = (rho_current[2:] - rho_current[:-2]) / (2 * dx)
-            drho_dx[0] = drho_dx[1]
-            drho_dx[-1] = drho_dx[-2]
+            # drho_dx = torch.zeros_like(rho_current)
+            # drho_dx[1:-1] = (rho_current[2:] - rho_current[:-2]) / (2 * dx)
+            # drho_dx[0] = drho_dx[1]
+            # drho_dx[-1] = drho_dx[-2]
             
             # === 8. Compute time derivative ===
             rho_t = (rho_next - rho_current) / DT
@@ -250,13 +259,13 @@ def train_rj_net(config, output_dir):
             
             # === 11. Reaction consistency loss ===
             # 讓反應網路學到的 r 與 exact reaction 接近
-            r_exact = exact_reaction(rho_current, p['k_plus'], p['k_minus'])
-            loss_reaction = torch.mean((r_next.squeeze() - r_exact.detach())**2)
+            # r_exact = exact_reaction(rho_current, p['k_plus'], p['k_minus'])
+            # loss_reaction = torch.mean((r_next.squeeze() - r_exact.detach())**2)
             
             # Accumulate losses
             total_loss_pde += loss_pde
-            total_loss_bc += loss_bc
-            total_loss_reaction += loss_reaction
+            # total_loss_bc += loss_bc
+            # total_loss_reaction += loss_reaction
             
             # Update for next iteration (detach to avoid backprop through time)
             rho_current = rho_next.detach()
@@ -266,8 +275,9 @@ def train_rj_net(config, output_dir):
         # === 8. Total loss ===
         total_loss = (
             t['weight_pde'] * total_loss_pde + 
-            t['weight_bc'] * total_loss_bc + 
-            t['weight_reaction'] * total_loss_reaction
+            # t['weight_bc'] * total_loss_bc * 0 + 
+            # t['weight_reaction'] * total_loss_reaction * 0 +
+            t['weight_ic'] * total_loss_ic
         )
         
         # Backpropagation
@@ -284,7 +294,7 @@ def train_rj_net(config, output_dir):
         if (epoch + 1) % 100 == 0:
             print(f"Epoch [{epoch+1}/{t['epochs']}]")
             print(f"  Total Loss: {total_loss.item():.6f}")
-            print(f"  PDE: {total_loss_pde.item():.6f}, BC: {total_loss_bc.item():.6f}, Reaction: {total_loss_reaction.item():.6f}")
+            print(f"  PDE: {total_loss_pde.item():.6f}, BC: {total_loss_bc.item():.6f}, Reaction: {total_loss_reaction.item():.6f}, IC: {total_loss_ic.item():.6f}")
     
     print("\n✅ Training complete!")
     
@@ -316,14 +326,16 @@ def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, confi
     J_history = []
     
     # Initialize
-    rho_0 = initial_condition(x).detach()
+    # 使用精確初始條件確保統一
+    rho_exact_ic = exact_traveling_wave(x, torch.tensor([p['t_min']], device=device)[0]).detach()
+    rho_0 = rho_exact_ic  # 統一使用精確初始條件
     R_current = torch.zeros_like(rho_0)
     J_current = torch.ones_like(rho_0)
     rho_current = (rho_0 + R_current) / J_current
     
     # Store initial state
     rho_numerical_history.append(rho_current.cpu().numpy())
-    rho_exact_history.append(exact_traveling_wave(x, torch.tensor([p['t_min']], device=device)[0]).cpu().numpy())
+    rho_exact_history.append(exact_traveling_wave(x, torch.tensor([p['t_min']], device=device)[0]).detach().cpu().numpy())
     J_history.append(J_current.cpu().numpy())
     
     # Time marching (evaluation mode)
@@ -362,7 +374,7 @@ def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, confi
             
             # Store results
             rho_numerical_history.append(rho_next.cpu().numpy())
-            rho_exact_history.append(exact_traveling_wave(x, t_current).cpu().numpy())
+            rho_exact_history.append(exact_traveling_wave(x, t_current).detach().cpu().numpy())
             u_history.append(u_next.cpu().numpy())
             r_history.append(r_next.cpu().numpy())
             J_history.append(J_next.cpu().numpy())
@@ -436,7 +448,7 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
     for i in range(len(rho_numerical_history)):
         error = np.abs(rho_numerical_history[i].flatten() - rho_exact_history[i].flatten())
         # 使用 L2 誤差
-        l2_error = np.sqrt(np.trapz(error**2, x_flat) if 'trapz' in dir(np) else np.mean(error**2))
+        l2_error = np.sqrt(np.trapezoid(error**2, x_flat))
         error_history.append(l2_error)
     
     axes[1, 1].plot(time_steps_np, error_history, 'b-', linewidth=2, label='L₂ error: ||ρ_num - ρ_exact||')
