@@ -1,10 +1,10 @@
 # 物理與網格參數
 physics:
-  x_min: -5.0
-  x_max: 5.0
+  x_min: 0.0
+  x_max: 1.0
   t_min: 0.0
-  t_max: 2.0
-  nx: 201  # 空間網格點數
+  t_max: 1.0
+  nx: 101  # 空間網格點數
   nt: 101  # 時間步數
   
   # Fisher-KPP 旅行波參數
@@ -24,9 +24,7 @@ training:
   
   # 損失函數權重
   weight_pde: 1.0
-  weight_bc: 0.1
   weight_ic: 10.0    # 強化初始條件約束
-  weight_reaction: 5.0  # 增加反應項權重以改進收斂
 
 # 視覺化參數
 visualization:

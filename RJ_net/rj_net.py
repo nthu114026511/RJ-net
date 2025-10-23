@@ -32,6 +32,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 from datetime import datetime
+import time
 
 # Import custom plotter module
 import plotter
@@ -121,6 +122,9 @@ def initial_condition(x, x0=0.0):
 def train_rj_net(config, output_dir):
     """Main training function for RJ-net."""
     
+    # Start training timer
+    training_start_time = time.time()
+    
     # Get parameters from config
     p = config['physics']
     t = config['training']
@@ -151,8 +155,7 @@ def train_rj_net(config, output_dir):
     loss_history = {
         'total': [],
         'pde': [],
-        'bc': [],
-        'reaction': []
+        'ic': []
     }
     
     # Get diffusion coefficient
@@ -181,8 +184,6 @@ def train_rj_net(config, output_dir):
         
         total_loss = 0.0
         total_loss_pde = 0.0
-        total_loss_bc = 0.0
-        total_loss_reaction = 0.0
         total_loss_ic = 0.0
         
         # === Initial condition loss ===
@@ -255,7 +256,7 @@ def train_rj_net(config, output_dir):
             
             # === 10. Boundary conditions ===
             # Neumann BC: 零通量邊界（梯度為零）
-            loss_bc = 0.1 * (drho_dx[0]**2 + drho_dx[-1]**2)
+            # loss_bc = 0.1 * (drho_dx[0]**2 + drho_dx[-1]**2)
             
             # === 11. Reaction consistency loss ===
             # 讓反應網路學到的 r 與 exact reaction 接近
@@ -287,14 +288,13 @@ def train_rj_net(config, output_dir):
         # Record losses
         loss_history['total'].append(total_loss.item())
         loss_history['pde'].append(total_loss_pde.item())
-        loss_history['bc'].append(total_loss_bc.item())
-        loss_history['reaction'].append(total_loss_reaction.item())
+        loss_history['ic'].append(total_loss_ic.item())
         
         # Print progress
         if (epoch + 1) % 100 == 0:
             print(f"Epoch [{epoch+1}/{t['epochs']}]")
             print(f"  Total Loss: {total_loss.item():.6f}")
-            print(f"  PDE: {total_loss_pde.item():.6f}, BC: {total_loss_bc.item():.6f}, Reaction: {total_loss_reaction.item():.6f}, IC: {total_loss_ic.item():.6f}")
+            print(f"  PDE: {total_loss_pde.item():.6f}, IC: {total_loss_ic.item():.6f}")
     
     print("\n✅ Training complete!")
     
@@ -400,9 +400,9 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
     """Perform comprehensive analysis including reaction comparison and mass conservation."""
     
     p = config['physics']
-    
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
+
     # Select time indices for visualization
     time_indices = [0, len(u_history)//3, 2*len(u_history)//3, len(u_history)-1]
     
@@ -476,6 +476,9 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
 def main():
     """Main execution function."""
     
+    # Start overall timer
+    overall_start_time = time.time()
+    
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='RJ-net: Reaction-Jacobian Network')
     # Default config path is in the same directory as this script
@@ -512,20 +515,36 @@ def main():
     print(f"\n✅ Configuration loaded from: {args.config}")
     print(f"✅ Results will be saved to: {output_dir}\n")
     
-    # Train the model
+    # Train the model with timer
+    print("="*60)
+    print("TRAINING PHASE")
+    print("="*60)
+    training_start_time = time.time()
     velocity_net, reaction_net, loss_history, x, time_steps, device = train_rj_net(config, output_dir)
+    training_time = time.time() - training_start_time
+    print(f"\n✅ Training completed in {training_time:.2f} seconds ({training_time/60:.2f} minutes)\n")
     
     # Evaluate the model
+    print("="*60)
+    print("EVALUATION PHASE")
+    print("="*60)
+    evaluation_start_time = time.time()
     rho_numerical_history, rho_exact_history, u_history, r_history, J_history = evaluate_diffusion_reaction(
         velocity_net, reaction_net, x, time_steps, config, device
     )
+    evaluation_time = time.time() - evaluation_start_time
+    print(f"✅ Evaluation completed in {evaluation_time:.2f} seconds\n")
     
     # Convert to numpy for plotting
     x_np = x.cpu().detach().numpy()
     time_steps_np = time_steps.cpu().numpy()
     
     # Create visualizations
-    print("\nCreating visualizations...")
+    print("="*60)
+    print("VISUALIZATION PHASE")
+    print("="*60)
+    visualization_start_time = time.time()
+    print("Creating visualizations...")
     
     # Plot loss history
     plotter.plot_loss(loss_history, config, f"{output_dir}/loss.png")
@@ -541,13 +560,26 @@ def main():
         x_np, u_history, r_history, rho_numerical_history, rho_exact_history,
         time_steps_np, reaction_net, config, device, output_dir
     )
+    visualization_time = time.time() - visualization_start_time
+    print(f"✅ Visualization completed in {visualization_time:.2f} seconds\n")
     
     # Save configuration for reference
     with open(f"{output_dir}/config_used.yaml", 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
     
+    # Calculate and display total execution time
+    overall_time = time.time() - overall_start_time
+    
     print("\n" + "="*60)
     print("✅ All tasks complete!")
+    print("="*60)
+    print("\n⏱️  EXECUTION TIME SUMMARY:")
+    print("-" * 60)
+    print(f"  Training phase:      {training_time:8.2f} seconds ({training_time/overall_time*100:5.1f}%)")
+    print(f"  Evaluation phase:    {evaluation_time:8.2f} seconds ({evaluation_time/overall_time*100:5.1f}%)")
+    print(f"  Visualization phase: {visualization_time:8.2f} seconds ({visualization_time/overall_time*100:5.1f}%)")
+    print("-" * 60)
+    print(f"  TOTAL:               {overall_time:8.2f} seconds ({overall_time/60:5.2f} minutes)")
     print("="*60)
     print(f"\nResults saved to: {output_dir}")
     print("  - loss.png: Training loss evolution")
