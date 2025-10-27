@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DR-PINN: Diffusion-Reaction Physics-Informed Neural Network
-
 本程式實現了基於物理的神經網路（PINN）求解擴散-反應系統：
 
     ∂ρ/∂t = ν·∇²ρ + r(x, ρ)
@@ -93,11 +91,11 @@ def exact_traveling_wave(x, t, x0=0.0):
     """
     sqrt6 = torch.sqrt(torch.tensor(6.0, device=x.device, dtype=x.dtype))
     s = 5.0 / sqrt6  # 波速
-    xi = (x - s * t - x0) / sqrt6  # 行進波座標
+    xi = (x - s * t - x0) / (nu * sqrt6)  # 行進波座標
     return (1.0 + torch.exp(-xi))**(-2)
 
 
-def initial_condition(x, x0=0.0):
+def initial_condition(x, x0=0.5):
     """
     Initial condition: Fisher-KPP 旅行波 (Ablowitz-Zeppetella)
     
@@ -112,7 +110,7 @@ def initial_condition(x, x0=0.0):
     """
     sqrt6 = torch.sqrt(torch.tensor(6.0, device=x.device, dtype=x.dtype))
     # 精確解的初始條件
-    return (1.0 + torch.exp(-(x - x0) / sqrt6))**(-2)
+    return (1.0 + torch.exp(-(x - x0) / (nu * sqrt6)))**(-2)
 
 
 # ===========================
@@ -158,8 +156,8 @@ def train_rj_net(config, output_dir):
         'ic': []
     }
     
-    # Get diffusion coefficient
-    nu = p.get('nu', 0.01)  # diffusion coefficient
+    # Get diffusion coefficientXXX
+    nu = p.get('nu', 0.001)  # diffusion coefficient
     
     print(f"✅ Training setup complete.")
     print(f"   Spatial points: {p['nx']}")
@@ -251,7 +249,7 @@ def train_rj_net(config, output_dir):
             # PDE: ∂ρ/∂t = ν·∂²ρ/∂x² + r(ρ)
             # Residual: ∂ρ/∂t - ν·∂²ρ/∂x² - r ≈ 0
             diffusion_term = nu * d2rho_dx2
-            pde_residual = rho_t - diffusion_term - r_next.squeeze()
+            pde_residual = rho_t - diffusion_term - r_next
             loss_pde = torch.mean(pde_residual**2)
             
             # === 10. Boundary conditions ===
@@ -293,8 +291,8 @@ def train_rj_net(config, output_dir):
         # Print progress
         if (epoch + 1) % 100 == 0:
             print(f"Epoch [{epoch+1}/{t['epochs']}]")
-            print(f"  Total Loss: {total_loss.item():.6f}")
-            print(f"  PDE: {total_loss_pde.item():.6f}, IC: {total_loss_ic.item():.6f}")
+            print(f"  Total Loss: {total_loss.item():.6e}")
+            print(f"  PDE: {total_loss_pde.item():.6e}, IC: {total_loss_ic.item():.6e}")
     
     print("\n✅ Training complete!")
     
@@ -311,7 +309,6 @@ def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, confi
     p = config['physics']
     DT = (p['t_max'] - p['t_min']) / (p['nt'] - 1)
     dx = (p['x_max'] - p['x_min']) / (p['nx'] - 1)
-    nu = p.get('nu', 0.01)
     
     print("\nGenerating results and creating visualizations...\n")
     
@@ -409,8 +406,10 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
     for idx in time_indices:
         if idx < len(u_history):
             t_val = time_steps_np[idx+1]  # +1 because we didn't store initial u,r
-            axes[0, 0].plot(x_np, u_history[idx], label=f't={t_val:.2f}')
-            axes[0, 1].plot(x_np, r_history[idx], label=f't={t_val:.2f}')
+            y_u = u_history[idx].squeeze(-1) if hasattr(u_history[idx], "shape") else u_history[idx]
+            y_r = r_history[idx].squeeze(-1) if hasattr(r_history[idx], "shape") else r_history[idx]
+            axes[0, 0].plot(x_np, y_u, label=f't={t_val:.2f}')
+            axes[0, 1].plot(x_np, y_r, label=f't={t_val:.2f}')
     
     axes[0, 0].set_title('Velocity Field u(x,t)')
     axes[0, 0].set_xlabel('x')
