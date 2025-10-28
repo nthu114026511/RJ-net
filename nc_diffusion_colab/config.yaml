@@ -1,9 +1,9 @@
 # 物理與網格參數
 physics:
-  x_min: 0.0
-  x_max: 1.0
+  x_min: -10.0
+  x_max: 10.0
   t_min: 0.0
-  t_max: 1.0
+  t_max: 15.0
   nx: 101  # 空間網格點數
   nt: 101  # 時間步數
 

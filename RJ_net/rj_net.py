@@ -31,8 +31,6 @@ import matplotlib.pyplot as plt
 import argparse
 from datetime import datetime
 import time
-
-# Import custom plotter module
 import plotter
 
 
@@ -71,16 +69,6 @@ class ReactionNet(nn.Module):
         """Input: [x, ρ], Output: r"""
         return self.network(x_rho)
 
-
-# ===========================
-# Helper Functions
-# ===========================
-
-def exact_reaction(rho, k_plus, k_minus):
-    """Exact reaction term: r = k⁺ρ - k⁻ρ²"""
-    return k_plus * rho - k_minus * rho**2
-
-
 def exact_traveling_wave(x, t, x0=0.0):
     """
     Fisher-KPP 精確旅行波解：
@@ -91,11 +79,11 @@ def exact_traveling_wave(x, t, x0=0.0):
     """
     sqrt6 = torch.sqrt(torch.tensor(6.0, device=x.device, dtype=x.dtype))
     s = 5.0 / sqrt6  # 波速
-    xi = (x - s * t - x0) / (nu * sqrt6)  # 行進波座標
+    xi = (x - s * t - x0) / (sqrt6)  # 行進波座標
     return (1.0 + torch.exp(-xi))**(-2)
 
 
-def initial_condition(x, x0=0.5):
+def initial_condition(x, x0=0.0):
     """
     Initial condition: Fisher-KPP 旅行波 (Ablowitz-Zeppetella)
     
@@ -110,7 +98,7 @@ def initial_condition(x, x0=0.5):
     """
     sqrt6 = torch.sqrt(torch.tensor(6.0, device=x.device, dtype=x.dtype))
     # 精確解的初始條件
-    return (1.0 + torch.exp(-(x - x0) / (nu * sqrt6)))**(-2)
+    return (1.0 + torch.exp(-(x - x0) / (sqrt6)))**(-2)
 
 
 # ===========================
@@ -155,9 +143,6 @@ def train_rj_net(config, output_dir):
         'pde': [],
         'ic': []
     }
-    
-    # Get diffusion coefficientXXX
-    nu = p.get('nu', 0.001)  # diffusion coefficient
     
     print(f"✅ Training setup complete.")
     print(f"   Spatial points: {p['nx']}")
@@ -248,25 +233,13 @@ def train_rj_net(config, output_dir):
             # === 9. Compute PDE residual ===
             # PDE: ∂ρ/∂t = ν·∂²ρ/∂x² + r(ρ)
             # Residual: ∂ρ/∂t - ν·∂²ρ/∂x² - r ≈ 0
-            diffusion_term = nu * d2rho_dx2
+            diffusion_term = d2rho_dx2
             pde_residual = rho_t - diffusion_term - r_next
             loss_pde = torch.mean(pde_residual**2)
             
-            # === 10. Boundary conditions ===
-            # Neumann BC: 零通量邊界（梯度為零）
-            # loss_bc = 0.1 * (drho_dx[0]**2 + drho_dx[-1]**2)
-            
-            # === 11. Reaction consistency loss ===
-            # 讓反應網路學到的 r 與 exact reaction 接近
-            # r_exact = exact_reaction(rho_current, p['k_plus'], p['k_minus'])
-            # loss_reaction = torch.mean((r_next.squeeze() - r_exact.detach())**2)
-            
-            # Accumulate losses
+
             total_loss_pde += loss_pde
-            # total_loss_bc += loss_bc
-            # total_loss_reaction += loss_reaction
-            
-            # Update for next iteration (detach to avoid backprop through time)
+
             rho_current = rho_next.detach()
             R_current = R_next.detach()
             J_current = J_next.detach()
@@ -398,7 +371,7 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
     
     p = config['physics']
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
     # Select time indices for visualization
     time_indices = [0, len(u_history)//3, 2*len(u_history)//3, len(u_history)-1]
@@ -408,38 +381,15 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
             t_val = time_steps_np[idx+1]  # +1 because we didn't store initial u,r
             y_u = u_history[idx].squeeze(-1) if hasattr(u_history[idx], "shape") else u_history[idx]
             y_r = r_history[idx].squeeze(-1) if hasattr(r_history[idx], "shape") else r_history[idx]
-            axes[0, 0].plot(x_np, y_u, label=f't={t_val:.2f}')
-            axes[0, 1].plot(x_np, y_r, label=f't={t_val:.2f}')
+            axes[0].plot(x_np, y_u, label=f't={t_val:.2f}')
     
-    axes[0, 0].set_title('Velocity Field u(x,t)')
-    axes[0, 0].set_xlabel('x')
-    axes[0, 0].set_ylabel('u')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
+    axes[0].set_title('Velocity Field u(x,t)')
+    axes[0].set_xlabel('x')
+    axes[0].set_ylabel('u')
+    axes[0].legend()
+    axes[0].grid(True)
     
-    axes[0, 1].set_title('Reaction Rate r(x,t)')
-    axes[0, 1].set_xlabel('x')
-    axes[0, 1].set_ylabel('r')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    # Compare learned reaction with exact reaction
-    rho_test = torch.linspace(0, 1, 100, device=device).view(-1, 1)
-    x_test = 0.5 * torch.ones_like(rho_test)
-    net_input_test = torch.cat([x_test, rho_test], dim=1)
-    
-    with torch.no_grad():
-        r_learned = reaction_net(net_input_test).cpu().numpy()
-        r_exact = exact_reaction(rho_test, p['k_plus'], p['k_minus']).cpu().numpy()
-    
-    rho_test_np = rho_test.cpu().numpy()
-    axes[1, 0].plot(rho_test_np, r_exact, 'g-', linewidth=2, label='Exact: k⁺ρ - k⁻ρ²')
-    axes[1, 0].plot(rho_test_np, r_learned, 'r--', linewidth=2, label='Learned r_NN(ρ)')
-    axes[1, 0].set_title('Reaction Rate: Learned vs Exact')
-    axes[1, 0].set_xlabel('ρ')
-    axes[1, 0].set_ylabel('r(ρ)')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
+
     
     # 比較數值解與精確解的誤差
     x_flat = x_np.flatten()
@@ -450,13 +400,13 @@ def perform_full_analysis(x_np, u_history, r_history, rho_numerical_history, rho
         l2_error = np.sqrt(np.trapezoid(error**2, x_flat))
         error_history.append(l2_error)
     
-    axes[1, 1].plot(time_steps_np, error_history, 'b-', linewidth=2, label='L₂ error: ||ρ_num - ρ_exact||')
-    axes[1, 1].set_title('Error Evolution: Numerical vs Exact Solution')
-    axes[1, 1].set_xlabel('t')
-    axes[1, 1].set_ylabel('L₂ Error')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True)
-    axes[1, 1].set_yscale('log')
+    axes[1].plot(time_steps_np, error_history, 'b-', linewidth=2, label='L₂ error: ||ρ_num - ρ_exact||')
+    axes[1].set_title('Error Evolution: Numerical vs Exact Solution')
+    axes[1].set_xlabel('t')
+    axes[1].set_ylabel('L₂ Error')
+    axes[1].legend()
+    axes[1].grid(True)
+    axes[1].set_yscale('log')
     
     plt.tight_layout()
     plt.savefig(f"{output_dir}/analysis.png", dpi=150)
