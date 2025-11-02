@@ -133,12 +133,13 @@ def train_rj_net(config):
     for epoch in range(t['epochs']):
         optimizer.zero_grad()
         
-        # Initialize variables according to: ρ = (ρ₀ + R) / J
+        # Initialize variables according to: ρ = (ρ₀ + R)*I
         rho_0 = exact_traveling_wave(x, torch.tensor(0.0, device=x.device)).detach()  # Initial density ρ₀
         R_current = torch.zeros_like(rho_0)     # R(t=0) = 0
-        J_current = torch.ones_like(rho_0)      # J(t=0) = 1
-        rho_current = (rho_0 + R_current) / J_current
-        
+        I_current = torch.ones_like(rho_0)      # I(t=0) = 1
+        Y_current = x.clone().detach()          # Y(x, 0) = x
+        rho_current = (rho_0 + R_current) * I_current
+
         total_loss = 0.0
         total_loss_pde = 0.0
         total_loss_ic = 0.0
@@ -154,49 +155,60 @@ def train_rj_net(config):
             # Prepare network input: [x, ρⁿ]
             net_input = torch.cat([x, rho_current], dim=1)
             
-            # === 1. Predict velocity uⁿ⁺¹ = u_NN(ρⁿ) ===
+            # === Predict velocity uⁿ⁺¹ = u_NN(ρⁿ) ===
             u_next = velocity_net(net_input)
             
-            # === 2. Predict reaction rate rⁱⁿ⁺¹ = r_NN(ρⁿ, x) ===
+            # === Predict reaction rate rⁱⁿ⁺¹ = r_NN(ρⁿ, x) ===
             r_next = reaction_net(net_input)
             
-            # === 3. Update reaction integral: Rⁱⁿ⁺¹ = Rⁱⁿ + Δt·rⁱⁿ ===
+            # === Update reaction integral: Rⁱⁿ⁺¹ = Rⁱⁿ + Δt·rⁱⁿ ===
             R_next = R_current + DT * r_next
+
+            # === Update I: Iⁿ⁺¹ = Iⁿ - Δt·∇·(Iⁿuⁿ) ===
+            # Compute ∇·(I*u) using autograd (精確的自動微分)
+            # This represents the divergence of the Jacobian flux
+            Iu = I_current * u_next
+            div_Iu = torch.autograd.grad(Iu.sum(), x, create_graph=True)[0]
             
-            # === 4. Compute ∇·u for Jacobian update ===
-            # ∂u/∂x using autograd
+            I_next = I_current - DT * div_Iu
+            
+            # === Compute ∇·u using autograd ===
+            # ∂u/∂x using autograd (精確的自動微分)
             du_dx = torch.autograd.grad(u_next, x, grad_outputs=torch.ones_like(u_next), create_graph=True)[0]
-
-            # === 5. Update I: Iⁿ⁺¹ = Iⁿ - Δt·∇·(Iⁿuⁿ) ===
-            # Compute ∇·(I*u) = I·∇u + u·∇I
-            # ∇·(I*u) using finite difference
-            Iu = J_current * u_next
-            div_Iu = torch.zeros_like(J_current)
-            div_Iu[1:-1] = (Iu[2:] - Iu[:-2]) / (2 * dx)
-            div_Iu[0] = (Iu[1] - Iu[0]) / dx
-            div_Iu[-1] = (Iu[-1] - Iu[-2]) / dx
-
-            J_next = J_current - DT * div_Iu
             
-            # === 6. Update density: ρⁿ⁺¹ = (ρ₀ + Rⁿ⁺¹) / Jⁿ⁺¹ ===
-            # Add small epsilon to avoid division by zero
-            eps = 1e-8
-            J_next_safe = torch.clamp(J_next, min=eps)
-            rho_next = (rho_0 + R_next) / J_next_safe
+            # === Compute ∇·(Y*u) using autograd ===
+            # Method: Compute (Y*u) first, then take derivative
+            Yu = Y_current * u_next
+            div_Yu = torch.autograd.grad(Yu.sum(), x, create_graph=True)[0]
             
-            # === 7. Compute spatial derivatives for PDE residual ===
+
+            # === Update Y according to: ∂Y/∂t + ∇·(Y*u) = Y(∇·u) ===
+            # Rearranged: ∂Y/∂t = Y(∇·u) - ∇·(Y*u)
+            # Time discretization: Y^{n+1} = Y^n - Δt·[∇·(Y*u) + Y*(∇·u)]
+            # Where: ∇·(Y*u) = ∂(Y*u)/∂x (computed using autograd as div_Yu)
+            #        ∇·u = ∂u/∂x (computed using autograd as du_dx)
+            Y_next = Y_current - DT * (div_Yu + Y_current * du_dx)
+            
+
+            rho_0_Y = exact_traveling_wave(Y_next, time_steps[n+1]).detach()  # Update ρ₀(Y, t)
+
+            # === Update density: ρⁿ⁺¹ = (ρ₀。Y + Rⁿ⁺¹) * Iⁿ⁺¹ ===
+            rho_next = (rho_0_Y + R_next) * I_next
+
+            # === Compute spatial derivatives for PDE residual ===
             # Second derivative ∂²ρ/∂x² (for diffusion term)
             drho_dx = torch.autograd.grad(rho_next, x, grad_outputs=torch.ones_like(rho_next), create_graph=True)[0]
             d2rho_dx2 = torch.autograd.grad(drho_dx, x, grad_outputs=torch.ones_like(drho_dx), create_graph=True)[0]
             
-            # === 8. Compute time derivative ===
+            # === Compute time derivative ===
             rho_t = (rho_next - rho_current) / DT
             
-            # === 9. Compute PDE residual ===
-            # PDE: ∂ρ/∂t = ν·∂²ρ/∂x² + r(ρ)
-            # Residual: ∂ρ/∂t - ν·∂²ρ/∂x² - r ≈ 0
+            # === Compute PDE residual ===
+            # PDE: ∂ρ/∂t = ∂²ρ/∂x² + ρ - ρ²
+            # Residual: ∂ρ/∂t - ∂²ρ/∂x² - (ρ - ρ²) ≈ 0
             diffusion_term = d2rho_dx2
-            pde_residual = rho_t - diffusion_term - r_next
+            reaction_term = rho_next - rho_next**2  # Fisher-KPP reaction: ρ(1-ρ)
+            pde_residual = rho_t - diffusion_term - reaction_term
             loss_pde = torch.mean(pde_residual**2)
             
 
@@ -204,13 +216,11 @@ def train_rj_net(config):
 
             rho_current = rho_next.detach()
             R_current = R_next.detach()
-            J_current = J_next.detach()
+            I_current = I_next.detach()
         
         # === 8. Total loss ===
         total_loss = (
             t['weight_pde'] * total_loss_pde + 
-            # t['weight_bc'] * total_loss_bc * 0 + 
-            # t['weight_reaction'] * total_loss_reaction * 0 +
             t['weight_ic'] * total_loss_ic
         )
         
@@ -254,13 +264,12 @@ def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, confi
     rho_numerical_history = []
     rho_exact_history = []
     
-    # Initialize
-    # 使用精確初始條件確保統一
-    rho_exact_ic = exact_traveling_wave(x, torch.tensor([p['t_min']], device=device)[0]).detach()
-    rho_0 = rho_exact_ic  # 統一使用精確初始條件
-    R_current = torch.zeros_like(rho_0)
-    J_current = torch.ones_like(rho_0)
-    rho_current = (rho_0 + R_current) / J_current
+    # Initialize variables according to: ρ = (ρ₀ + R)*I
+    rho_0 = exact_traveling_wave(x, torch.tensor(0.0, device=x.device)).detach()  # Initial density ρ₀
+    R_current = torch.zeros_like(rho_0)     # R(t=0) = 0
+    I_current = torch.ones_like(rho_0)      # I(t=0) = 1
+    Y_current = x.clone().detach()          # Y(x, 0) = x
+    rho_current = (rho_0 + R_current) * I_current
     
     # Store initial state
     rho_numerical_history.append(rho_current.cpu().numpy())
@@ -272,29 +281,43 @@ def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, confi
         
         net_input = torch.cat([x, rho_current], dim=1)
         
-        # Predict velocity and reaction rate
+        # === 1. Predict velocity uⁿ⁺¹ = u_NN(ρⁿ) ===
         u_next = velocity_net(net_input)
+        
+        # === 2. Predict reaction rate rⁿ⁺¹ = r_NN(ρⁿ, x) ===
         r_next = reaction_net(net_input)
         
-        # Update R: Rⁿ⁺¹ = Rⁿ + Δt·r
+        # === 3. Update reaction integral: Rⁿ⁺¹ = Rⁿ + Δt·rⁿ ===
         R_next = R_current + DT * r_next
         
-        # Compute ∂u/∂x for Jacobian using autograd
+        # === 4. Update I: Iⁿ⁺¹ = Iⁿ - Δt·∇·(Iⁿuⁿ) ===
+        # Compute ∇·(I*u) using finite difference
+        Iu = I_current * u_next
+        div_Iu = torch.zeros_like(I_current)
+        div_Iu[1:-1] = (Iu[2:] - Iu[:-2]) / (2 * dx)
+        div_Iu[0] = (Iu[1] - Iu[0]) / dx
+        div_Iu[-1] = (Iu[-1] - Iu[-2]) / dx
+        
+        I_next = I_current - DT * div_Iu
+        
+        # === 5. Compute ∇·u and ∇·(Y*u) for Y update ===
+        # ∂u/∂x using autograd
         du_dx = torch.autograd.grad(u_next, x, grad_outputs=torch.ones_like(u_next), create_graph=False, retain_graph=True)[0]
         
-        # Compute ∂J/∂x for Jacobian using finite difference (since J_current doesn't require grad)
-        dJ_dx = torch.zeros_like(J_current)
-        dJ_dx[1:-1] = (J_current[2:] - J_current[:-2]) / (2 * dx)
-        dJ_dx[0] = (J_current[1] - J_current[0]) / dx
-        dJ_dx[-1] = (J_current[-1] - J_current[-2]) / dx
+        # === Compute ∇·(Y*u) using autograd ===
+        # Method: Compute (Y*u) first, then take derivative
+        Yu = Y_current * u_next
+        div_Yu = torch.autograd.grad(Yu.sum(), x, create_graph=False)[0]
         
-        # Update Jacobian: Jⁿ⁺¹ = Jⁿ + Δt·(∇·u)Jⁿ - u·∇J
-        J_next = J_current + DT * (du_dx * J_current - u_next * dJ_dx)
+        # === Update Y according to: ∂Y/∂t + ∇·(Y*u) = Y(∇·u) ===
+        # Rearranged: ∂Y/∂t = Y(∇·u) - ∇·(Y*u)
+        # Time discretization: Y^{n+1} = Y^n - Δt·[∇·(Y*u) + Y*(∇·u)]
+        Y_next = Y_current - DT * (div_Yu + Y_current * du_dx)
         
-        # Update density: ρⁿ⁺¹ = (ρ₀ + Rⁿ⁺¹) / Jⁿ⁺¹
-        eps = 1e-8
-        J_next_safe = torch.clamp(J_next, min=eps)
-        rho_next = (rho_0 + R_next) / J_next_safe
+        rho_0_Y = exact_traveling_wave(Y_next, time_steps[n+1]).detach()  # Update ρ₀ for current time
+        
+        # === 6. Update density: ρⁿ⁺¹ = (ρ₀ + Rⁿ⁺¹) * Iⁿ⁺¹ ===
+        rho_next = (rho_0_Y + R_next) * I_next
         
         # Store results (only density for plotting)
         rho_numerical_history.append(rho_next.detach().cpu().numpy())
@@ -303,7 +326,8 @@ def evaluate_diffusion_reaction(velocity_net, reaction_net, x, time_steps, confi
         # Update for next iteration
         rho_current = rho_next.detach()
         R_current = R_next.detach()
-        J_current = J_next.detach()
+        I_current = I_next.detach()
+        Y_current = Y_next.detach()
     
     print("✅ Solution generated.")
     print(f"   Final ρ (numerical) range: [{rho_numerical_history[-1].min():.4f}, {rho_numerical_history[-1].max():.4f}]")
