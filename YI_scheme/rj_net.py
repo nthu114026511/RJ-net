@@ -217,6 +217,7 @@ def train_rj_net(config):
             rho_current = rho_next.detach()
             R_current = R_next.detach()
             I_current = I_next.detach()
+            Y_current = Y_next.detach()
         
         # === 8. Total loss ===
         total_loss = (
